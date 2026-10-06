@@ -19,6 +19,7 @@
 #include "SessionConfigurationUtils.h"
 #include <android/data_space.h>
 #include <camera/StringUtils.h>
+#include <camera/VendorTagDescriptor.h>
 #include <gui/Flags.h>  // remove with WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
 #include <ui/PublicFormat.h>
 #include "../CameraService.h"
@@ -1354,6 +1355,35 @@ void filterParameters(const CameraMetadata& src, const CameraMetadata& deviceInf
             filteredParams.update(entry);
         }
     }
+
+    // Oplus camera compatibility: the stock Oplus camera expects the client
+    // package name and the OCS camera unit marker to reach the Oplus camera HAL
+    // even though the HAL does not advertise all of them in
+    // ANDROID_REQUEST_AVAILABLE_SESSION_KEYS (ColorOS keeps them as well). The
+    // tags are only present when the client or the camera service added them,
+    // so this is a no-op for every other client.
+    static const char* kOplusSessionTagNames[] = {
+        "com.oplus.packageName",
+        "com.oplus.activityName",
+        "com.oplus.is.sdk.camera.package",
+    };
+    sp<VendorTagDescriptorCache> vtCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    sp<VendorTagDescriptor> vTags = nullptr;
+    if (vtCache.get() != nullptr) {
+        vtCache->getVendorTagDescriptor(vendorTagId, &vTags);
+    }
+    if (vTags.get() != nullptr) {
+        for (const char* tagName : kOplusSessionTagNames) {
+            uint32_t tag = 0;
+            if (CameraMetadata::getTagFromName(tagName, vTags.get(), &tag) == OK) {
+                camera_metadata_ro_entry entry = params.find(tag);
+                if (entry.count > 0) {
+                    filteredParams.update(entry);
+                }
+            }
+        }
+    }
+
     dst = std::move(filteredParams);
 }
 

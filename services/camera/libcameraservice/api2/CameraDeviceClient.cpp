@@ -15,6 +15,7 @@
  */
 
 #include "system/camera_metadata.h"
+#include <string.h>
 #define LOG_TAG "CameraDeviceClient"
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 #ifdef LOG_NNDEBUG
@@ -27,8 +28,10 @@
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <android/content/res/CameraCompatibilityInfo.h>
+#include <camera/CameraMetadata.h>
 #include <camera/CameraUtils.h>
 #include <camera/StringUtils.h>
+#include <camera/VendorTagDescriptor.h>
 #include <camera/camera2/CaptureRequest.h>
 #include <com_android_internal_camera_flags.h>
 #include <cutils/properties.h>
@@ -853,6 +856,60 @@ binder::Status CameraDeviceClient::beginConfigureLocked() {
     return binder::Status::ok();
 }
 
+namespace {
+
+// Oplus camera compatibility.
+//
+// The stock Oplus camera expects the client package name and the OCS camera
+// unit marker to be present in the session parameters as the vendor tags
+// com.oplus.packageName (TYPE_BYTE x128) and
+// com.oplus.is.sdk.camera.package (TYPE_BYTE x1). ColorOS injects them in its
+// camera service; do the same here so every session of the stock camera
+// carries them, no matter which client API created it. The tags are declared
+// by the Oplus camera HAL, so this is a no-op on devices that do not declare
+// them.
+void addOplusSessionParameters(const std::string& clientPackageName,
+        const CameraMetadata& staticInfo, CameraMetadata* sessionParams) {
+    static constexpr const char kOplusCameraPackage[] = "com.oplus.camera";
+    static constexpr const char kOplusCameraActivity[] = "com.oplus.camera.Camera";
+    if (sessionParams == nullptr || clientPackageName != kOplusCameraPackage) {
+        return;
+    }
+
+    sp<VendorTagDescriptorCache> vtCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    sp<VendorTagDescriptor> vTags = nullptr;
+    if (vtCache.get() != nullptr) {
+        vtCache->getVendorTagDescriptor(staticInfo.getVendorId(), &vTags);
+    }
+
+    uint32_t packageTag = 0;
+    if (CameraMetadata::getTagFromName("com.oplus.packageName", vTags.get(),
+            &packageTag) == OK) {
+        char packageName[128] = {};
+        memcpy(packageName, kOplusCameraPackage, strlen(kOplusCameraPackage));
+        sessionParams->update(packageTag,
+                reinterpret_cast<const uint8_t*>(packageName), sizeof(packageName));
+    }
+
+    uint32_t sdkCameraTag = 0;
+    if (CameraMetadata::getTagFromName("com.oplus.is.sdk.camera.package", vTags.get(),
+            &sdkCameraTag) == OK) {
+        uint8_t isSdkCamera = 1;
+        sessionParams->update(sdkCameraTag, &isSdkCamera, 1);
+    }
+
+    uint32_t activityTag = 0;
+    if (CameraMetadata::getTagFromName("com.oplus.activityName", vTags.get(),
+            &activityTag) == OK) {
+        char activityName[128] = {};
+        memcpy(activityName, kOplusCameraActivity, strlen(kOplusCameraActivity));
+        sessionParams->update(activityTag,
+                reinterpret_cast<const uint8_t*>(activityName), sizeof(activityName));
+    }
+}
+
+}  // namespace
+
 binder::Status CameraDeviceClient::endConfigure(int operatingMode,
         const hardware::camera2::impl::CameraMetadataNative& sessionParams, int64_t startTimeMs,
         std::vector<int>* offlineStreamIds /*out*/) {
@@ -894,7 +951,13 @@ binder::Status CameraDeviceClient::endConfigureLocked(int operatingMode,
         return res;
     }
 
-    status_t err = mDevice->configureStreams(sessionParams, operatingMode);
+    // Oplus camera compatibility: the stock Oplus camera expects the camera
+    // service to inject the client package name and the OCS camera unit marker
+    // into the session parameters (ColorOS does this server-side).
+    hardware::camera2::impl::CameraMetadataNative oplusSessionParams(sessionParams);
+    addOplusSessionParameters(getPackageName(), mDevice->info(), &oplusSessionParams);
+
+    status_t err = mDevice->configureStreams(oplusSessionParams, operatingMode);
     if (err == BAD_VALUE) {
         std::string msg = fmt::sprintf("Camera %s: Unsupported set of inputs/outputs provided",
                 mCameraIdStr.c_str());
